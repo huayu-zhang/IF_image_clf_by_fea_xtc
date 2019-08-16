@@ -1,0 +1,466 @@
+---
+title: "Feature_extraction_pipeline_using_EBImage"
+author: "Huayu"
+date: "2019 M08 14"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# Env setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+# Librarys
+required_libs <- c("tiff", "ggplot2", "png", "EBImage", "raster")
+
+new_libs <- required_libs[!(required_libs %in% installed.packages()[,"Package"])]
+
+if (length(new_libs) > 0) install.packages(new_libs, dependencies = T, quiet = T)
+
+new_libs <- required_libs[!(required_libs %in% installed.packages()[,"Package"])]
+
+if (length(new_libs) > 0)
+{
+  if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager", quiet = T)
+  
+  BiocManager::install(new_libs)
+}
+
+
+for (i in 1:length(required_libs))
+  library(required_libs[i], character.only = T)
+
+rm(list = c("i", "new_libs", "required_libs"))
+
+sessionInfo()
+
+
+# Function definiations
+img.Import <- function(index, fileList) # Import image file and assemble the list
+{
+  imgRGB <- readTIFF(source = fileList$RGB[index])
+  imgYGB <- readTIFF(source = fileList$YGB[index])
+  
+  return(list(
+    R = imgRGB[,,1],
+    G = imgRGB[,,2],
+    B = imgRGB[,,3],
+    Y = imgYGB[,,1]
+  ))
+}
+
+img.Import_512 <- function(index, fileList) # Import image file and assemble the list
+{
+  return(
+  
+  list(
+    "R" = readPNG(source = fileList$R[index]),
+    "G" = readPNG(source = fileList$G[index]),
+    "B" = readPNG(source = fileList$B[index]),
+    "Y" = readPNG(source = fileList$Y[index])
+  )
+  )
+  
+}
+
+binChannel <- function(channel) # Binarize channels using the background color plus 5/255
+{
+  step <- c()
+  
+  for (i in 1:30)
+  {
+    step[i] <- sum(channel < i/255 & channel >= (i-1)/255)
+  }
+  
+   
+  return((which.max(step) + 5)/255)
+}
+
+
+Nb8 <- as.matrix(expand.grid(x = -1:1, y = -1:1))
+
+
+nbEight <- function(x, minEdge = 0, maxEdge = 513) { # Get neightbours of positive area
+  n <- nrow(x)
+  series <- rep(1:n, each = 9)
+  nbs <- x[series,]
+  nbs[,1] <- nbs[,1] + Nb8[,1]
+  nbs[,2] <- nbs[,2] + Nb8[,2]
+  
+  nbs <- unique(nbs)
+  nbs <- nbs[(nbs[,1] > minEdge) & (nbs[,1] < maxEdge) &  (nbs[,2] > minEdge) & (nbs[,2] < maxEdge) ,]
+  
+  
+  nbs
+}
+
+rimOfNuclei <- function(nucMask) # Get rim of nuclues
+{
+  rims <- do.call(rbind, ocontour(nucMask))
+  n <- nrow(nucMask)
+  
+  if (n == 0) 
+  
+  rims <- nbEight(rims)
+  rimsLin <- (rims[,2] - 1) * n + rims[,1]
+  
+  rimMask <- rep(0, n^2)
+  
+  rimMask[rimsLin] <- 1
+  rimMask <- matrix(rimMask, nrow = n)
+  
+  rimMask
+
+}
+
+huayu.cutoff <- function(img)
+{
+  if (sum(img[img > 0]) < 50)
+    return(0.01)
+  
+  img_hist <- hist(img[img > 0], breaks = 50, plot = F)$density
+  n <- length(img_hist)
+  
+  img_hist_d1 <- img_hist[2:n] - img_hist[1:(n-1)]
+  img_hist_d2 <- img_hist_d1[2:(n-1)] - img_hist_d1[1:(n-2)]
+  
+  img_hist_d2_fluc <- abs(img_hist_d2) > 0.05
+  
+  for (i in (n-3):10)
+    if (sum(img_hist_d2_fluc[(i-1):(i+1)]) == 3)
+      if (img_hist_d2[i-1] > 0 & img_hist_d2[i] < 0 & img_hist_d2 [i + 1]> 0)
+        return(i * 0.02)
+  
+  for (i in (n-3):1)
+    if (img_hist_d2_fluc[i]) return(i * 0.02)
+  
+  return(quantile(img, prob = 0.95))
+}
+
+coloc <- function(bin1, bin2)
+{
+  
+  
+  if (sum(bin1) == 0 | sum(bin2) == 0 ) return(0)
+  
+  both <- sum(bin1 & bin2)
+  
+  ratio1 <- both/sum(bin1)
+  ratio2 <- both/sum(bin2)
+  
+  colocScore <- 2*ratio1*ratio2/(ratio1 + ratio2)
+  
+  return(colocScore)
+}
+
+
+# File list
+
+img_list <- list(
+  RGB = list.files(path = "./example_img/img/RGB/", full.names = T),
+  YGB = list.files(path = "./example_img/img/YGB/", full.names = T)
+)
+
+img_512_list = list(
+  R = list.files(path = "./example_img/img_512/", pattern = "red", full.names = T),
+  G = list.files(path = "./example_img/img_512/", pattern = "green", full.names = T),
+  B = list.files(path = "./example_img/img_512/", pattern = "blue", full.names = T),
+  Y = list.files(path = "./example_img/img_512/", pattern = "yellow", full.names = T)
+)
+
+
+```
+
+
+# Image import
+
+Import both original resolution image and image with reduced sise (512 by 512)
+Immunofluorescent (IF) images are list of 4 channels: Red, Green, Blue and Yellow
+Green channel is the information channel and the other channels are reference channel: Red (F-actin), Blue (DNA), Yellow (Mitochondria)
+Resolution of orignal image is recorded
+
+```{r}
+img <- img.Import(index = 1, fileList = img_list)
+img_512 <- img.Import_512(index = 1, fileList = img_512_list)
+    
+wh <- dim(img$R)[1]
+
+print("structure of img is:")
+str(img)
+
+print("sturcture of img_512 is:")
+str(img_512)
+```
+
+Preview of the channels
+
+```{r}
+display(img_512$R)
+display(img_512$G)
+display(img_512$B)
+display(img_512$Y)
+```
+
+
+# Object mask creation
+
+This section aims to create the masks for areas and objects in the IF image
+including:
+ * Nuclei
+ * Cytoplasm
+ * Extracellular area
+
+ 
+## Image binarization
+
+Binarize image on cutoff 5/255 higher than background color. Binarized images are used for finilizing the masks. For computation efficiency, low resolution image is used. 
+ * DNA reference makes nucleus region
+ * F-actin and mitochondria conbined for cytoplasm region
+
+```{r}
+img_cutoffs <- sapply(img_512, binChannel)
+
+img_bin_512 <- list(
+      "R" = img_512$R > img_cutoffs["R"],
+      "G" = img_512$G > img_cutoffs["G"],
+      "B" = img_512$B > img_cutoffs["B"],
+      "Y" = img_512$Y > img_cutoffs["Y"]
+    )
+
+display(img_bin_512$B)
+```
+
+## Fillhull, watershed and remove noices
+
+Fill the holes in large areas
+
+```{r}
+img_masks_512 <- list(
+      "B" = fillHull(img_bin_512$B),
+      "RY" = img_bin_512$R | img_bin_512$Y
+    )
+
+display(img_masks_512$B)
+display(img_masks_512$RY)
+```
+
+Watershedding to define objects
+Remove extra small objects, which are noise dots
+Watershedding returns number matrix same size as the image. Indexes are given to objects, and number 0 is give to background.
+Objects on the edge of the image are removed, becasue they are outlayers for many calculations.
+
+```{r}
+img_masks_512$B <- watershed(x = distmap(img_masks_512$B), tolerance = 1, ext = 3)
+img_table_512 <- list(
+      "B" = table(img_masks_512$B)
+    )
+img_masks_512$B <- rmObjects(x = img_masks_512$B, index = names(img_table_512$B)[img_table_512$B < 100])
+img_table_512$B <- table(img_masks_512$B)
+
+img_table_512$Bminus <- table(img_masks_512$B[2:511, 2:511])
+img_masks_512$Bminus <- rmObjects(x = img_masks_512$B, index = names(img_table_512$B)[img_table_512$B > img_table_512$Bminus])
+
+display(colorLabels(img_masks_512$B))
+display(colorLabels(img_masks_512$Bminus))
+    
+```
+
+
+
+
+```{r}
+img_masks_512$RYinv <- bwlabel(1 - img_masks_512$RY)
+img_table_512$RYinv <- table(img_masks_512$RYinv)
+img_masks_512$RYinv <- rmObjects(x = img_masks_512$RYinv, index = names(img_table_512$RYinv)[img_table_512$RYinv > 20])
+img_masks_512$RY[img_masks_512$RYinv > 0] <- 1
+img_masks_512$RYinv <- NULL
+    
+img_masks_512$RY <- bwlabel(img_masks_512$RY)
+img_table_512$RY <- table(img_masks_512$RY)
+img_masks_512$RY <- rmObjects(x = img_masks_512$RY, index = names(img_table_512$RY)[img_table_512$RY < 100])
+img_masks_512$RY[img_masks_512$B > 0] <- 0 
+
+display(colorLabels(img_masks_512$RY))
+```
+
+Create mask for rim of nuclei, great mask for identifying nucleomembrane
+
+```{r}
+img_masks_512$rimB <- rimOfNuclei(nucMask = img_masks_512$Bminus)
+display(x = img_masks_512$rimB)
+```
+
+## Upscale of the masks to full resolution
+```{r}
+img_masks <- lapply(img_masks_512, function(x, fact) as.matrix(disaggregate(x = raster(x), fact = fact)), fact = wh/512)
+```
+
+
+# Masks for signals in green channel
+
+## Segmentation of green channel signals
+
+Disect the green signal according to the masks (subcellular areas)
+
+```{r}
+img_Green <- list(
+      "Nucleus" = img$G,
+      "Cytosol" = img$G,
+      "Rest" = img$G
+    )
+    
+    img_Green$Nucleus[img_masks$B == 0] <- 0
+    img_Green$Cytosol[img_masks$RY == 0] <- 0
+    img_Green$Rest[img_masks$B > 0| img_masks$RY > 0 ] <- 0
+    
+    display(img_Green$Nucleus)
+    display(img_Green$Cytosol)
+    display(img_Green$Rest)
+    
+```
+
+
+## Object masks for Green signals
+Emprical way to deside cutoffs for green signal
+Method 1: Otsu method which is more loose
+Method 2: Right most fluctuation of 2nd derivative/Right most non-zero 2nd derivative, which is more stringent
+For Nuclues and Cytosol use both methods
+For Rest use Otsu only
+Libraries with too many labels is a huge computation burden, sampling will be done
+
+The otsu cutoff
+
+```{r}
+img_cutoffs <- c(img_cutoffs, 
+                     G.Otsu = sapply(img_Green, otsu),
+                     G.Huayu = sapply(img_Green[1:2], huayu.cutoff),
+                     G.Otsu = otsu(img_512$G), 
+                     G.Huayu = huayu.cutoff(img_512$G),
+                     "R.Otsu" = otsu(img_512$R),
+                     "B.Otsu" = otsu(img_512$B),
+                     "Y.Otsu" = otsu(img_512$Y)
+    )
+    
+    
+img_masks_G.Otsu <- list(
+      "Nucleus" = bwlabel(x = img_Green$Nucleus > img_cutoffs["G.Otsu.Nucleus"]),
+      "Cytosol" = bwlabel(x = img_Green$Cytosol > img_cutoffs["G.Otsu.Cytosol"]),
+      "Rest" = bwlabel(x = img_Green$Rest > img_cutoffs["G.Otsu.Rest"])
+      
+    )
+    
+img_table_G.Otsu <- lapply(X = img_masks_G.Otsu, FUN = table)
+    
+img_masks_G.Otsu$Nucleus <- rmObjects(
+  x = img_masks_G.Otsu$Nucleus, 
+  index = names(img_table_G.Otsu$Nucleus)[img_table_G.Otsu$Nucleus < 10])
+
+if (sum(img_table_G.Otsu$Nucleus >= 10) > 200)
+  img_masks_G.Otsu$Nucleus <- rmObjects(
+    x = img_masks_G.Otsu$Nucleus, 
+    index = names(img_table_G.Otsu$Nucleus)[sample(1:sum(img_table_G.Otsu$Nucleus >= 10), sum(img_table_G.Otsu$Nucleus >= 10) - 200)])
+    
+    
+img_masks_G.Otsu$Cytosol <- rmObjects(
+  x = img_masks_G.Otsu$Cytosol, 
+  index = names(img_table_G.Otsu$Cytosol)[img_table_G.Otsu$Cytosol < 10])
+if (sum(img_table_G.Otsu$Cytosol >=10) > 200)
+      img_masks_G.Otsu$Cytosol <- rmObjects(
+        x = img_masks_G.Otsu$Cytosol, 
+        index = names(img_table_G.Otsu$Cytosol)[sample(1:sum(img_table_G.Otsu$Cytosol >= 10), sum(img_table_G.Otsu$Cytosol >= 10) - 200)])
+    
+img_masks_G.Otsu$Rest <- rmObjects(
+      x = img_masks_G.Otsu$Rest, 
+      index = names(img_table_G.Otsu$Rest)[img_table_G.Otsu$Rest < 10])
+if (sum(img_table_G.Otsu$Rest >=10) > 200)
+      img_masks_G.Otsu$Rest <- rmObjects(
+        x = img_masks_G.Otsu$Rest, 
+        index = names(img_table_G.Otsu$Rest)[sample(1:sum(img_table_G.Otsu$Rest >= 10), sum(img_table_G.Otsu$Rest >= 10) - 200)])
+
+display(colorLabels(img_masks_G.Otsu$Nucleus))
+display(colorLabels(img_masks_G.Otsu$Cytosol))
+
+
+```
+
+My customized cutoff
+This more strigent cutoff captures objects with very strong signals, such as substructures in nuclei. 
+
+```{r}
+img_masks_G.Huayu <- list(
+      "Nucleus" = bwlabel(x = img_Green$Nucleus > img_cutoffs["G.Huayu.Nucleus"]),
+      "Cytosol" = bwlabel(x = img_Green$Cytosol > img_cutoffs["G.Huayu.Cytosol"])
+    )
+    
+img_table_G.Huayu <- lapply(X = img_masks_G.Huayu, FUN = table)
+    
+    
+if (sum(img_table_G.Huayu$Nucleus >= 10) > 100)
+    img_masks_G.Huayu$Nucleus <- rmObjects(
+      x = img_masks_G.Huayu$Nucleus, 
+      index = names(img_table_G.Huayu$Nucleus)[order(img_table_G.Huayu$Nucleus, decreasing = T)[51:length(img_table_G.Huayu$Nucleus)]])
+    
+    
+if (sum(img_table_G.Huayu$Cytosol >=10) > 100)
+    img_masks_G.Huayu$Cytosol <- rmObjects(
+      x = img_masks_G.Huayu$Cytosol, 
+      index = names(img_table_G.Huayu$Cytosol)[order(img_table_G.Huayu$Cytosol, decreasing = T)[51:length(img_table_G.Huayu$Cytosol)]])
+    
+    
+display(colorLabels(img_masks_G.Huayu$Nucleus))
+display(colorLabels(img_masks_G.Huayu$Cytosol))
+    
+```
+
+
+# Compute object features
+
+Features are computed using
+ * colocolization of green signal to reference channels
+ * Object properties using masks
+
+
+```{r}
+manualFeatures <- c(
+      "GcolocB" = coloc(bin1 = img$G > img_cutoffs["G.Otsu"], bin2 = img$B > img_cutoffs["B.Otsu"]),
+      "GcolocR" = coloc(bin1 = img$G > img_cutoffs["G.Otsu"], bin2 = img$R > img_cutoffs["R.Otsu"]),
+      "GcolocY" = coloc(bin1 = img$G > img_cutoffs["G.Otsu"], bin2 = img$Y > img_cutoffs["Y.Otsu"]),
+      "GcolocRimB" = coloc(bin1 = img$G > img_cutoffs["G.Otsu"], bin2 = img_masks$rimB),
+      img_cutoffs
+    )
+    
+    
+
+featureList <- list(
+      "manualFeatures" = manualFeatures,
+      "M.Blue_Its.Blue" = computeFeatures(x = img_masks$B, ref = img$B), ##Mask: Blue, Ref: Blue, Information of nucleus properties
+      "M.Blue_Its.Green" = computeFeatures(x = img_masks$B, ref = img$G), ##Mask: Blue, Ref: Green, Gain: Average signal properties per nucleus
+      "M.G.Nuc.Otsu_Its.Green" = computeFeatures(x = img_masks_G.Otsu$Nucleus, ref = img$G), ##Mask: HDR Green in Nucleus, Ref: Green, Gain: Green signal properties in Nucleus
+      "M.G.Nuc.Huayu_Its.Green" = computeFeatures(x = img_masks_G.Huayu$Nucleus, ref = img$G), ##See above
+      "M.G.Cyt.Otsu_Its.Green" = computeFeatures(x = img_masks_G.Otsu$Cytosol, ref = img$G),##Mask: HDR Green in Cytosol, Ref: Green, Gain: Green signal properties in Cytosol
+      "M.G.Cyt.Huayu_Its.Green" = computeFeatures(x = img_masks_G.Huayu$Cytosol, ref = img$G), ##See above
+      "M.G.Rest.Otsu_Its.Green" = computeFeatures(x = img_masks_G.Otsu$Rest, ref = img$G),##Mask: Green in Rest, Ref: Green, Gain: Green signal properties in Rest
+      "M.G.Cyt.Otsu_Its.Red" = computeFeatures(x = img_masks_G.Otsu$Cytosol, ref = img$R),##Mask: HDR Green in Cytosol, Ref: Red, Gain: Relation of green signal and red signal
+      "M.G.Cyt.Huayu_Its.Red" = computeFeatures(x = img_masks_G.Huayu$Cytosol, ref = img$R),##See above
+      "M.G.Cyt.Otsu_Its.Yellow" = computeFeatures(x = img_masks_G.Otsu$Cytosol, ref = img$Y),##Mask: HDR Green in Cytosol, Ref: Yellow, Gain: Relation of green signal and yellow signal
+      "M.G.Cyt.Huayu_Its.Yellow" = computeFeatures(x = img_masks_G.Huayu$Cytosol, ref = img$Y)##See above
+    )  
+
+```
+
+The featureList objects contain all colocalization, shape and texture features. 
+
+```{r}
+str(featureList)
+```
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```
+
